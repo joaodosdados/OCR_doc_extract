@@ -1,4 +1,5 @@
-"""Extração de documentos cartorários com embeddings e JSON estruturado.
+"""
+Extração de documentos cartorários com embeddings e JSON estruturado.
 
 Um único arquivo com tudo: detecção, extração, embedding e export.
 Extensível para novos tipos de documentos no futuro.
@@ -11,6 +12,7 @@ import os
 import re
 import time
 import uuid
+
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -31,7 +33,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 load_dotenv()
 
+# =============================================================================
+# PREÇOS (Gemini Developer API / AI Studio)
+# =============================================================================
+# gemini-2.5-flash
+FLASH_INPUT_USD_PER_1M = 0.30
+FLASH_OUTPUT_USD_PER_1M = 2.50
+
+# Embedding (referência; dependendo da conta/produto, pode variar)
+EMBED_INPUT_USD_PER_1M = 0.15
+
+# Câmbio para estimativa (ajuste ou mova para .env se quiser)
+USD_TO_BRL = float(os.getenv("USD_TO_BRL", "5.25"))
+
+# =============================================================================
 # Prompt para extração
+# =============================================================================
+
 EXTRACTION_PROMPT = """Você receberá uma imagem de um documento de registro de imóveis de cartório brasileiro.
 INSTRUÇÕES CRÍTICAS:
 
@@ -79,7 +97,6 @@ INSTRUÇÕES CRÍTICAS:
    - SE NÃO TEM CERTEZA, PREFIRA *** - ISSO É MELHOR QUE RETORNAR TEXTO ERRADO
 
 Retorne APENAS o texto extraído, sem avisos ou comentários."""
-
 
 # =============================================================================
 # CONFIGURAÇÃO DE CAMPOS CARTORÁRIOS
@@ -172,7 +189,7 @@ class FieldExtractor:
     def extrair(texto: str, tipo: str) -> Dict[str, str]:
         """Extrai campos estruturados do texto."""
         campos = DocumentConfigurations.get_campos_por_tipo(tipo)
-        resultado = {}
+        resultado: Dict[str, str] = {}
 
         for campo in campos:
             try:
@@ -184,7 +201,7 @@ class FieldExtractor:
                         else match.group(0).strip()
                     )
                     resultado[campo.chave] = valor
-            except re.error:  # noqa: BLE001
+            except re.error:
                 logger.warning("Erro no regex para %s", campo.chave)
 
         if not resultado:
@@ -247,21 +264,119 @@ def calculate_hash(file_path: str) -> str:
     return sha256.hexdigest()
 
 
+def extract_usage_metadata(resp) -> dict:
+    """
+    Extrai contagem de tokens da resposta do SDK do Google.
+    O formato pode variar por versão/modelo, então tentamos múltiplas rotas.
+    Retorna dict possivelmente com:
+      - prompt_token_count
+      - candidates_token_count
+      - total_token_count
+      - cached_content_token_count
+    """
+    usage: dict = {}
+
+    um = getattr(resp, "usage_metadata", None)
+    if um is not None:
+        # Caso seja objeto com atributos
+        for k in (
+            "prompt_token_count",
+            "candidates_token_count",
+            "total_token_count",
+            "cached_content_token_count",
+        ):
+            if hasattr(um, k):
+                usage[k] = getattr(um, k)
+        # Caso seja dict
+        if not usage and isinstance(um, dict):
+            usage = dict(um)
+
+    # Fallback: tenta model_dump (pydantic) se existir
+    if not usage:
+        try:
+            d = resp.model_dump()
+        except Exception:
+            d = None
+        if isinstance(d, dict):
+            um2 = d.get("usage_metadata") or d.get("usageMetadata") or d.get("usage")
+            if isinstance(um2, dict):
+                usage = dict(um2)
+
+    return usage
+
+
+def estimate_flash_cost_usd(usage: dict) -> Optional[dict]:
+    """
+    Estima custo do gemini-2.5-flash baseado em usage_metadata.
+    Como total_token_count inclui imagem+prompt+etc, usamos:
+      output = candidates_token_count
+      input  = total_token_count - candidates_token_count
+    """
+    if not usage:
+        return None
+
+    total = usage.get("total_token_count")
+    out_toks = usage.get("candidates_token_count")
+
+    if not isinstance(total, int) or not isinstance(out_toks, int):
+        return None
+
+    in_toks = max(0, total - out_toks)
+
+    cost_usd = (in_toks / 1_000_000) * FLASH_INPUT_USD_PER_1M + (
+        out_toks / 1_000_000
+    ) * FLASH_OUTPUT_USD_PER_1M
+    return {
+        "input_tokens_est": in_toks,
+        "output_tokens": out_toks,
+        "total_tokens": total,
+        "cost_usd": cost_usd,
+        "cost_brl": cost_usd * USD_TO_BRL,
+    }
+
+
+def estimate_embed_cost_usd(text_token_estimate: Optional[int]) -> Optional[dict]:
+    """
+    Estima custo de embedding por tokens de entrada (se você estimar/medir tokens).
+    Como o embed nem sempre retorna usage_metadata, deixamos opcional.
+    """
+    if not isinstance(text_token_estimate, int) or text_token_estimate <= 0:
+        return None
+    cost_usd = (text_token_estimate / 1_000_000) * EMBED_INPUT_USD_PER_1M
+    return {
+        "input_tokens_est": text_token_estimate,
+        "cost_usd": cost_usd,
+        "cost_brl": cost_usd * USD_TO_BRL,
+    }
+
+
 def generate_embedding(text: str, api_key: str) -> Optional[list]:
-    """Gera embedding do texto (1536 dimensões)."""
+    """Gera embedding do texto via Gemini API (gemini-embedding-001)."""
     try:
         client = genai.Client(api_key=api_key)
+
+        # Gemini Developer API embedding model
         result = client.models.embed_content(
-            model="text-embedding-004", contents=text[:2000]
+            model="gemini-embedding-001",
+            contents=text[:8000],  # ajuste depois se quiser
         )
-        # A resposta tem 'embeddings' (plural), que é uma lista de ContentEmbedding
-        if result.embeddings:
-            embedding_values = result.embeddings[0].values
-            logger.info("Embedding gerado (%d dimensões)", len(embedding_values))
-            return embedding_values
+
+        # Alguns SDKs retornam 'embeddings' e outros 'embedding'
+        emb = None
+        if hasattr(result, "embeddings") and result.embeddings:
+            emb = result.embeddings[0]
+        elif hasattr(result, "embedding"):
+            emb = result.embedding
+
+        if emb is not None and hasattr(emb, "values"):
+            logger.info("Embedding gerado (%d dimensões)", len(emb.values))
+            return emb.values
+
+        logger.warning("Embedding retornou vazio/inesperado")
         return None
-    except Exception:  # noqa: BLE001
-        logger.warning("Erro ao gerar embedding")
+
+    except Exception as e:
+        logger.warning("Erro ao gerar embedding: %s", e)
         return None
 
 
@@ -275,11 +390,16 @@ def extract_from_document(
 ) -> Dict:
     """Extrai texto de documento usando Gemini API."""
     start_time = time.time()
+    usage: dict = {}
 
     try:
         if not os.path.exists(image_path):
             logger.error("Arquivo não encontrado: %s", image_path)
-            return {"success": False, "error": f"Arquivo não encontrado: {image_path}"}
+            return {
+                "success": False,
+                "error": f"Arquivo não encontrado: {image_path}",
+                "usage": {},
+            }
 
         logger.info("Processando: %s", image_path)
 
@@ -296,7 +416,15 @@ def extract_from_document(
         )
         api_time = time.time() - api_start
 
-        extracted = response.text
+        usage = extract_usage_metadata(response)
+        if usage:
+            logger.info("TOKENS (%s): %s", model, usage)
+        else:
+            logger.warning(
+                "TOKENS: usage_metadata não veio na resposta (pode variar por SDK/modelo)."
+            )
+
+        extracted = response.text or ""
         file_name = Path(image_path).name
         legibility = analyze_legibility(extracted)
         file_hash = calculate_hash(image_path)
@@ -334,18 +462,20 @@ def extract_from_document(
             "classificacao": classification,
             "campos_extraidos": campos,
             "embedding": embedding,
+            "usage": usage,  # <-- CRÍTICO: agora o main consegue somar e calcular custo
         }
 
-    except Exception:  # noqa: BLE001
+    except Exception as e:
         processing_time = time.time() - start_time
-        logger.error("Erro ao processar documento")
+        logger.error("Erro ao processar documento: %s", e)
         return {
             "success": False,
-            "error": "Erro ao processar",
+            "error": str(e),
             "file_name": Path(image_path).name
             if os.path.exists(image_path)
             else image_path,
             "processing_time": processing_time,
+            "usage": usage or {},
         }
 
 
@@ -405,6 +535,8 @@ def export_to_json(result: Dict, output_path: Optional[str] = None) -> str:
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
+    usage = result.get("usage") or {}
+
     json_data = {
         "id": result["id"],
         "arquivo_original": result["arquivo_original"],
@@ -415,6 +547,7 @@ def export_to_json(result: Dict, output_path: Optional[str] = None) -> str:
             "tempo_total_segundos": result["processing_time"],
             "tempo_api_segundos": result["api_time"],
         },
+        "tokens": usage,
         "legibilidade": {
             "palavras_ilegíveis": result["legibility_analysis"]["illegible_count"],
             "total_palavras": result["legibility_analysis"]["total_words"],
@@ -446,7 +579,7 @@ def export_to_json(result: Dict, output_path: Optional[str] = None) -> str:
 
 
 def main():
-    """Executa pipeline completo."""
+    """Executa pipeline completo (lote de 5 imagens) e reporta tokens e custo."""
     main_start = time.time()
     logger.info("Iniciando em %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
@@ -455,29 +588,99 @@ def main():
         logger.error("GEMINI_API_KEY não configurada no .env")
         return
 
-    document_path = "img/3-img.jpeg"
-    if not os.path.exists(document_path):
-        logger.error("Arquivo não encontrado: %s", document_path)
-        return
+    image_paths = [
+        "img/1-img.jpeg",
+        "img/2-img.jpeg",
+        "img/3-img.jpeg",
+        "img/4-img.jpeg",
+        "img/5-img.jpeg",
+    ]
 
-    result = extract_from_document(document_path, api_key)
+    totals = {
+        "prompt_token_count": 0,
+        "candidates_token_count": 0,
+        "total_token_count": 0,
+        "cached_content_token_count": 0,
+    }
 
-    if not result["success"] and "RESOURCE_EXHAUSTED" in str(result.get("error", "")):
-        logger.warning("Tentando modelo alternativo...")
-        result = extract_from_document(
-            document_path, api_key, model="gemini-1.5-flash-8b"
+    total_cost_usd = 0.0
+    total_cost_brl = 0.0
+
+    ok = 0
+    for document_path in image_paths:
+        if not os.path.exists(document_path):
+            logger.error("Arquivo não encontrado: %s", document_path)
+            continue
+
+        result = extract_from_document(document_path, api_key)
+
+        # fallback de modelo (se estourar quota/limite)
+        if not result["success"] and "RESOURCE_EXHAUSTED" in str(
+            result.get("error", "")
+        ):
+            logger.warning("Tentando modelo alternativo...")
+            result = extract_from_document(
+                document_path, api_key, model="gemini-1.5-flash-8b"
+            )
+
+        if result["success"]:
+            ok += 1
+            usage = result.get("usage") or {}
+
+            # soma tokens do lote (quando vierem)
+            for k in totals.keys():
+                v = usage.get(k)
+                if isinstance(v, int):
+                    totals[k] += v
+
+            # custo estimado do Flash (quando der para estimar)
+            cost = estimate_flash_cost_usd(usage)
+            if cost:
+                total_cost_usd += cost["cost_usd"]
+                total_cost_brl += cost["cost_brl"]
+                logger.info(
+                    "CUSTO ESTIMADO: %s | in=%d out=%d total=%d | US$ %.6f | R$ %.4f",
+                    document_path,
+                    cost["input_tokens_est"],
+                    cost["output_tokens"],
+                    cost["total_tokens"],
+                    cost["cost_usd"],
+                    cost["cost_brl"],
+                )
+            else:
+                logger.warning(
+                    "CUSTO ESTIMADO: sem usage suficiente para calcular (%s)",
+                    document_path,
+                )
+
+            # se você quiser exportar para cada imagem, descomente:
+            # export_to_word(result)
+            # export_to_json(result)
+
+            logger.info(
+                "OK: %s | api_time=%.2fs | total_tokens=%s",
+                document_path,
+                result.get("api_time", -1),
+                usage.get("total_token_count"),
+            )
+        else:
+            logger.error("Falha em %s: %s", document_path, result.get("error"))
+
+    total_time = time.time() - main_start
+    logger.info("========================================")
+    logger.info("Resumo lote: %d/%d ok | %.2fs", ok, len(image_paths), total_time)
+    logger.info("TOKENS TOTAIS (lote): %s", totals)
+
+    if ok > 0:
+        logger.info(
+            "CUSTO TOTAL (LLM Flash): US$ %.6f | R$ %.4f | média por doc: US$ %.6f | R$ %.4f",
+            total_cost_usd,
+            total_cost_brl,
+            total_cost_usd / ok,
+            total_cost_brl / ok,
         )
-
-    if result["success"]:
-        word_path = export_to_word(result)
-        json_path = export_to_json(result)
-        total_time = time.time() - main_start
-
-        logger.info("✓ Concluído em %.2fs", total_time)
-        logger.info("  Word: %s", word_path)
-        logger.info("  JSON: %s", json_path)
     else:
-        logger.error("Falha: %s", result["error"])
+        logger.info("CUSTO TOTAL (LLM Flash): sem documentos processados com sucesso.")
 
 
 if __name__ == "__main__":
